@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+tools/mkfs.lmfs — DAY31 (第二月 · 第5周 · Day 31 of the LumaOS 5.0 roadmap)
+
+  "用 Python 编写 tools/mkfs.lmfs：创建空白 LMFS 镜像，写入超级块、
+   初始化 inode/data bitmap、创建根目录 inode。"
+  验收："生成 lmfs.img，十六进制查看器能看到 LMFS 魔数。"
+
+Day 29/30 只产出了文档（doc/lmfs.txt），今天是 LMFS 第一次真正落地
+成代码——但这段代码跑在"宿主机的 Python 解释器"里，不是内核代码，
+不需要编译、不需要 QEMU：它就是个普通的格式化工具，跟真实系统里的
+mkfs.ext4/mkfs.vfat 干的事一模一样——在宿主机上凭空造一个符合某种
+磁盘格式规范的空白镜像文件，供以后的内核驱动去读。所以今天的"跑
+通"标准也确实是宿主机上的"用十六进制查看器看一眼"，而不是启动 QEMU
+——这点在下面 verify() 里也会自动做一遍，等价于手工跑一次
+`xxd lmfs.img | head`。
+
+本文件严格按 doc/lmfs.txt 第二~九节定义的布局写：
+  - 超级块 lmfs_superblock_t：512 字节，卷内 LBA 1（doc 第二节）
+  - inode 结构 lmfs_inode_t：64 字节（doc 第七节）
+  - 卷内区域顺序：保留扇区 -> 超级块 -> inode 位图 -> 数据块位图
+    -> inode 表 -> 数据区（doc 第九节）
+  - 根目录固定用 0 号 inode（doc 第九节最后一段的约定）
+
+默认生成的镜像按 1.44MB 软盘换算（2880 个 512 字节扇区），呼应
+doc/lmfs.txt 里"块大小选 1024 字节是为了适配软盘/小硬盘"这个设计
+初衷，也跟本项目 tests/ 目录下 fat12 测试卷用的软盘尺寸保持一致，
+方便以后对照测试。inode 数量默认给 256 个——对一张软盘大小的测试卷
+来说，256 个文件/目录的上限已经远超测试需要，同时 256 个 inode 的
+inode 位图只占 32 字节，凑一个扇区还有大把富余，不会因为 inode 表
+本身就把小小的软盘塞满。
+"""
+import argparse
+import os
+import struct
+import sys
+
+# --------------------------------------------------------------------------
+# 常量：全部照抄 doc/lmfs.txt 里已经定好的数字，任何一个改了都要同步
+# 改文档，两边不能各说各话。
+# --------------------------------------------------------------------------
+SECTOR_SIZE = 512                    # 1 个 LBA = 512 字节（磁盘物理扇区）
+BLOCK_SIZE = 1024                    # doc 第六节：LMFS 块大小
+SECTORS_PER_BLOCK = BLOCK_SIZE // SECTOR_SIZE   # = 2，块号 -> LBA 的换算系数
+
+LMFS_MAGIC = 0x4C4D4653              # 'L''M''F''S'，doc 第二/三节
+LMFS_VERSION_MAJOR = 1
+LMFS_VERSION_MINOR = 0
+
+SUPERBLOCK_SIZE = 512                # doc 第二节：整块占满 1 个扇区
+SUPERBLOCK_LBA = 1                   # doc 第一节：卷内 LBA 1（LBA 0 保留）
+
+INODE_SIZE = 64                      # doc 第七节
+INODES_PER_BLOCK = BLOCK_SIZE // INODE_SIZE     # = 16
+
+LMFS_TYPE_FREE = 0                   # doc 第八节：type 字段取值约定
+LMFS_TYPE_FILE = 1
+LMFS_TYPE_DIR = 2
+
+ROOT_INODE_NUM = 0                   # doc 第九节末尾：根目录固定是 0 号 inode
+
+# 超级块的 struct 打包格式，字段顺序/大小逐一对应 doc 第二节的偏移表。
+# "<" 前缀 = little-endian、无对齐填充，字节序跟 x86 一致，且不会被
+# Python 自己按"原生对齐"偷偷插填充字节（那样算出来的 sizeof 就对不上
+# 文档里的 512 了）。
+#   I  = magic            (uint32)
+#   H  = version_major    (uint16)
+#   H  = version_minor    (uint16)
+#   I  = inode_count      (uint32)
+#   I  = data_block_count (uint32)
+#   I  = inode_bitmap_lba (uint32)
+#   I  = data_bitmap_lba  (uint32)
+#   I  = feature_compat   (uint32)
+#   I  = feature_incompat (uint32)
+#   I  = feature_ro_compat(uint32)
+#   476s = reserved[476]
+SUPERBLOCK_FMT = "<IHHIIIIIII476s"
+assert struct.calcsize(SUPERBLOCK_FMT) == SUPERBLOCK_SIZE, \
+    "超级块打包格式跟 doc/lmfs.txt 第二节的 512 字节对不上了"
+
+# inode 的 struct 打包格式，对应 doc 第七节的偏移表。
+#   I    = file_size      (uint32)
+#   I    = created_time   (uint32)
+#   B    = type           (uint8)
+#   3x   = reserved0，3 个填充字节，不占用 pack() 的参数位
+#   8I   = direct[8]      (8 个 uint32)
+#   I    = indirect1      (uint32)
+#   I    = indirect2      (uint32)
+#   12x  = reserved1，12 个填充字节
+INODE_FMT = "<IIB3x8III12x"
+assert struct.calcsize(INODE_FMT) == INODE_SIZE, \
+    "inode 打包格式跟 doc/lmfs.txt 第七节的 64 字节对不上了"
+
+
+def round_up_sectors(nbytes):
+    """把一个字节数向上取整成"占用几个 512 字节扇区"。
+
+    位图、inode 表这些元数据区域，doc 第九节里都是按扇区
+    （LBA，512 字节）对齐存放的——哪怕实际数据只有几十字节，也要
+    占满一整个扇区，这样每个区域的起始位置永远落在扇区边界上，
+    磁盘 I/O 不用处理"半个扇区"这种麻烦情况。
+    """
+    return (nbytes + SECTOR_SIZE - 1) // SECTOR_SIZE
+
+
+def round_up_even(n):
+    """把一个 LBA 向上取整成偶数。
+
+    doc 第九节：数据区的起始 LBA 必须是偶数，因为数据块的"块号 ->
+    LBA"换算是 LBA = 块号 * 2（doc 第六节，1 块 = 2 扇区）；只有数据区
+    起点本身就落在偶数 LBA 上，块号 0 才会对应到这个起点，块号 1 才会
+    紧接着对应到起点 +2 这个位置，后面的计算才不会全部错位。
+    """
+    return n if n % 2 == 0 else n + 1
+
+
+def build_layout(total_sectors, inode_count):
+    """按 doc/lmfs.txt 第九节的区域顺序，算出每个区域的起始 LBA 和
+    大小。只做算术，不碰磁盘/文件，方便单独测试这部分逻辑对不对。
+    """
+    # 卷内 LBA 0：保留扇区（doc 第一节，本阶段占位不用）
+    # 卷内 LBA 1：超级块，正好 1 个扇区
+    inode_bitmap_lba = SUPERBLOCK_LBA + (SUPERBLOCK_SIZE // SECTOR_SIZE)  # = 2
+
+    inode_bitmap_bytes = (inode_count + 7) // 8
+    inode_bitmap_sectors = round_up_sectors(inode_bitmap_bytes)
+
+    data_bitmap_lba = inode_bitmap_lba + inode_bitmap_sectors
+
+    inode_table_lba = data_bitmap_lba  # 占位，data bitmap 大小算出来后再加上偏移
+    inode_table_bytes = inode_count * INODE_SIZE
+    inode_table_sectors = round_up_sectors(inode_table_bytes)
+
+    # data_block_count 由"总扇区数减去前面所有元数据区域"反推出来。
+    # 数据块位图自己的大小又依赖 data_block_count——这是先有鸡还是
+    # 先有蛋的问题，但数据块位图最多也就几个扇区，跟总容量比可以
+    # 忽略不计，所以用"两遍逼近"：先假设 data bitmap 占 1 个扇区
+    # 算出一个 data_block_count 估计值，再用这个估计值重新算一次
+    # data bitmap 真实需要的扇区数，两次结果一般相同（本工具默认的
+    # 软盘尺寸下总是收敛到同一个值），如果偶尔因为边界刚好差 1 个
+    # 扇区导致还没收敛，就再迭代一轮，直至两次算出的扇区数一致。
+    data_bitmap_sectors = 1
+    for _ in range(4):  # 最多迭代 4 轮，正常 1~2 轮就会收敛
+        used_before_data = (data_bitmap_lba + data_bitmap_sectors
+                             + inode_table_sectors)
+        data_area_lba = round_up_even(used_before_data + 0)  # inode 表已含在 used_before_data 里，占位对齐见下
+        remaining_sectors = total_sectors - data_area_lba
+        if remaining_sectors < 0:
+            raise ValueError(
+                "镜像太小，连元数据区域都放不下（还差 %d 个扇区）"
+                % (-remaining_sectors))
+        data_block_count = (remaining_sectors * SECTOR_SIZE) // BLOCK_SIZE
+        new_bitmap_sectors = round_up_sectors((data_block_count + 7) // 8)
+        if new_bitmap_sectors == data_bitmap_sectors:
+            break
+        data_bitmap_sectors = new_bitmap_sectors
+    else:
+        raise ValueError("data bitmap 大小没有收敛，检查 build_layout() 逻辑")
+
+    inode_table_lba = data_bitmap_lba + data_bitmap_sectors
+    data_area_lba = round_up_even(inode_table_lba + inode_table_sectors)
+
+    return {
+        "inode_bitmap_lba": inode_bitmap_lba,
+        "inode_bitmap_sectors": inode_bitmap_sectors,
+        "data_bitmap_lba": data_bitmap_lba,
+        "data_bitmap_sectors": data_bitmap_sectors,
+        "inode_table_lba": inode_table_lba,
+        "inode_table_sectors": inode_table_sectors,
+        "data_area_lba": data_area_lba,
+        "data_block_count": data_block_count,
+    }
+
+
+def build_superblock(layout, inode_count):
+    reserved = b"\x00" * 476
+    return struct.pack(
+        SUPERBLOCK_FMT,
+        LMFS_MAGIC,
+        LMFS_VERSION_MAJOR,
+        LMFS_VERSION_MINOR,
+        inode_count,
+        layout["data_block_count"],
+        layout["inode_bitmap_lba"],
+        layout["data_bitmap_lba"],
+        0,  # feature_compat：v1.0 暂无可选特性，doc 第三节
+        0,  # feature_incompat
+        0,  # feature_ro_compat
+        reserved,
+    )
+
+
+def build_bitmap(total_bits, set_bits, sector_count):
+    """按 total_bits 个 bit 建一张位图，把 set_bits 里列出的编号置 1，
+    补齐到 sector_count 个扇区（doc 第九节：位图区域按扇区对齐）。
+    """
+    nbytes = sector_count * SECTOR_SIZE
+    buf = bytearray(nbytes)
+    for bit in set_bits:
+        if bit >= total_bits:
+            continue
+        buf[bit // 8] |= (1 << (bit % 8))
+    return bytes(buf)
+
+
+def build_root_inode():
+    """0 号 inode：根目录（doc 第八节 type 字段、第九节 inode 0 = 根
+    目录的约定）。目录项格式还没设计（doc 第十节明确留到以后），所以
+    这里只创建"这是一个目录"这个事实本身，file_size=0、8 个直接块和
+    indirect1/indirect2 全部是 0（还没有任何数据块分配给它——一个
+    没有任何文件/子目录的空目录，本来也不需要占用数据块）。
+    """
+    direct = [0] * 8
+    return struct.pack(
+        INODE_FMT,
+        0,               # file_size：空目录，暂时 0 字节内容
+        0,               # created_time：无 RTC 驱动，固定 0（doc 第八节）
+        LMFS_TYPE_DIR,   # type = 2 目录
+        *direct,
+        0,               # indirect1
+        0,               # indirect2
+    )
+
+
+def build_free_inode():
+    """除根目录外，其余 inode 槽位一律清零——type=LMFS_TYPE_FREE(0)，
+    跟 inode 位图里对应 bit 也是 0（未占用）保持一致（doc 第八节
+    type 字段详解那段特意点出的"两者要一致"）。
+    """
+    return b"\x00" * INODE_SIZE
+
+
+def make_image(output_path, total_sectors, inode_count, verbose=True):
+    layout = build_layout(total_sectors, inode_count)
+
+    image = bytearray(total_sectors * SECTOR_SIZE)
+
+    # 卷内 LBA 0：保留扇区，本阶段占位，保持全零（doc 第一节）——
+    # bytearray 初始化本来就是全零，这里不用额外写。
+
+    # 卷内 LBA 1：超级块
+    sb = build_superblock(layout, inode_count)
+    off = SUPERBLOCK_LBA * SECTOR_SIZE
+    image[off:off + SUPERBLOCK_SIZE] = sb
+
+    # inode 位图：只有 0 号（根目录）被占用
+    inode_bitmap = build_bitmap(
+        inode_count, {ROOT_INODE_NUM}, layout["inode_bitmap_sectors"])
+    off = layout["inode_bitmap_lba"] * SECTOR_SIZE
+    image[off:off + len(inode_bitmap)] = inode_bitmap
+
+    # 数据块位图：根目录暂时没有任何数据块，全部置 0（未占用）
+    data_bitmap = build_bitmap(
+        layout["data_block_count"], set(), layout["data_bitmap_sectors"])
+    off = layout["data_bitmap_lba"] * SECTOR_SIZE
+    image[off:off + len(data_bitmap)] = data_bitmap
+
+    # inode 表：0 号槽位是根目录 inode，其余全部清零空闲
+    off = layout["inode_table_lba"] * SECTOR_SIZE
+    image[off:off + INODE_SIZE] = build_root_inode()
+    for i in range(1, inode_count):
+        pos = off + i * INODE_SIZE
+        image[pos:pos + INODE_SIZE] = build_free_inode()
+
+    # 数据区：doc 第九节，从这里到卷尾都是数据块，mkfs 阶段没有任何
+    # 文件内容要写，保持全零即可（bytearray 默认已经是全零）。
+
+    with open(output_path, "wb") as f:
+        f.write(image)
+
+    if verbose:
+        print("=== tools/mkfs.lmfs — LMFS 镜像生成完毕 ===")
+        print("  输出文件        : %s" % output_path)
+        print("  镜像总大小      : %d 扇区 (%d 字节, %.2f KB)"
+              % (total_sectors, len(image), len(image) / 1024))
+        print("  块大小          : %d 字节 (%d 扇区/块)"
+              % (BLOCK_SIZE, SECTORS_PER_BLOCK))
+        print("  超级块          : LBA %d (%d 字节)"
+              % (SUPERBLOCK_LBA, SUPERBLOCK_SIZE))
+        print("  inode 数量      : %d (每个 %d 字节, 每块 %d 个)"
+              % (inode_count, INODE_SIZE, INODES_PER_BLOCK))
+        print("  inode 位图      : LBA %d, 占 %d 扇区"
+              % (layout["inode_bitmap_lba"], layout["inode_bitmap_sectors"]))
+        print("  数据块位图      : LBA %d, 占 %d 扇区"
+              % (layout["data_bitmap_lba"], layout["data_bitmap_sectors"]))
+        print("  inode 表        : LBA %d, 占 %d 扇区"
+              % (layout["inode_table_lba"], layout["inode_table_sectors"]))
+        print("  数据区          : LBA %d 起, 共 %d 块 (%d 字节)"
+              % (layout["data_area_lba"], layout["data_block_count"],
+                 layout["data_block_count"] * BLOCK_SIZE))
+        print("  根目录 inode    : %d 号 (type=DIR, 位于 inode 表第 0 项)"
+              % ROOT_INODE_NUM)
+
+    return layout
+
+
+def verify(output_path, inode_count, layout, verbose=True):
+    """回读刚写好的镜像，做几项和验收标准直接对应的检查：
+
+      1. 魔数：偏移 = LBA1 * 512 + 0，应该是 0x4C4D4653（"能用十六进制
+         查看器看到 LMFS 魔数"这条验收标准，这里用代码自动做一遍，
+         等价于手工执行一次 `xxd -s 512 -l 4 lmfs.img`）。
+      2. 版本号、inode/数据块数量、两个位图 LBA 能正确读回来。
+      3. inode 位图第 0 位确实是 1（根目录已分配）。
+      4. inode 表第 0 项确实是 type=DIR 的根目录 inode。
+
+    任何一项不符都直接 assert 失败并退出，不会让一个"看起来生成了
+    但其实内容不对"的镜像蒙混过关。
+    """
+    with open(output_path, "rb") as f:
+        data = f.read()
+
+    sb_off = SUPERBLOCK_LBA * SECTOR_SIZE
+    sb_raw = data[sb_off:sb_off + SUPERBLOCK_SIZE]
+    (magic, vmaj, vmin, inodes, dblocks, ib_lba, db_lba,
+     f_compat, f_incompat, f_rocompat, _reserved) = struct.unpack(
+        SUPERBLOCK_FMT, sb_raw)
+
+    assert magic == LMFS_MAGIC, \
+        "魔数不对：读到 0x%08X，期望 0x%08X" % (magic, LMFS_MAGIC)
+    assert (vmaj, vmin) == (LMFS_VERSION_MAJOR, LMFS_VERSION_MINOR)
+    assert inodes == inode_count
+    assert dblocks == layout["data_block_count"]
+    assert ib_lba == layout["inode_bitmap_lba"]
+    assert db_lba == layout["data_bitmap_lba"]
+    assert (f_compat, f_incompat, f_rocompat) == (0, 0, 0)
+
+    ib_off = layout["inode_bitmap_lba"] * SECTOR_SIZE
+    inode_bitmap = data[ib_off:ib_off + layout["inode_bitmap_sectors"]
+                         * SECTOR_SIZE]
+    assert inode_bitmap[0] & 0x01, "根目录（0 号 inode）在位图里没有被标记为已分配"
+
+    it_off = layout["inode_table_lba"] * SECTOR_SIZE
+    root_raw = data[it_off:it_off + INODE_SIZE]
+    unpacked = struct.unpack(INODE_FMT, root_raw)
+    r_size, r_ctime, r_type = unpacked[0], unpacked[1], unpacked[2]
+    r_direct = unpacked[3:11]
+    r_ind1, r_ind2 = unpacked[11], unpacked[12]
+    assert r_type == LMFS_TYPE_DIR, "根目录 inode 的 type 不是目录"
+    assert r_size == 0 and r_ind1 == 0 and r_ind2 == 0
+    assert all(d == 0 for d in r_direct)
+
+    if verbose:
+        print("")
+        print("=== 自检通过（等价于手工用十六进制查看器检查一遍） ===")
+        print("  偏移 0x%04X (LBA %d) 处 4 字节魔数 = 0x%08X ('LMFS')"
+              % (sb_off, SUPERBLOCK_LBA, magic))
+        print("  版本 = %d.%d, inode_count=%d, data_block_count=%d"
+              % (vmaj, vmin, inodes, dblocks))
+        print("  inode 位图第 0 位 = 1（根目录已分配）")
+        print("  inode 表第 0 项：type=DIR, file_size=0, 全部块指针=0")
+        print("")
+        print("  手工复核可以跑：")
+        print("    xxd -s %d -l 16 %s" % (sb_off, output_path))
+        print("  开头 4 字节应该是: 53 46 4d 4c"
+              " (little-endian 存的 0x4C4D4653，反过来读)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mkfs.lmfs",
+        description="创建一个空白的 LMFS (LumaOS 文件系统) 镜像文件，"
+                     "按 doc/lmfs.txt 定义的超级块/inode 布局写入超级块、"
+                     "初始化 inode 位图与数据块位图、创建根目录 inode。")
+    parser.add_argument(
+        "-o", "--output", default=None,
+        help="输出镜像路径，默认是仓库根目录下的 lmfs.img")
+    parser.add_argument(
+        "--sectors", type=int, default=2880,
+        help="镜像总扇区数（512 字节/扇区），默认 2880 = 1.44MB 软盘尺寸，"
+             "呼应 doc/lmfs.txt 里'块大小 1024 字节适合软盘/小硬盘'的设计初衷")
+    parser.add_argument(
+        "--inodes", type=int, default=256,
+        help="inode 总数，默认 256（对软盘大小的测试卷绰绰有余）")
+    parser.add_argument(
+        "--no-verify", action="store_true",
+        help="跳过写完之后的自动回读校验（默认会校验）")
+    args = parser.parse_args()
+
+    if args.output is None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_path = os.path.join(repo_root, "lmfs.img")
+    else:
+        output_path = args.output
+
+    layout = make_image(output_path, args.sectors, args.inodes)
+
+    if not args.no_verify:
+        verify(output_path, args.inodes, layout)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
