@@ -1,0 +1,18 @@
+1. 例如：
+IDE2/ >cd IDE0
+ - Changed directory to IDE0/
+
+IDE0/ >cd IDE1/
+ - Changed directory to IDE1/
+
+IDE1/ >
+2. 3. 不要show，只要read，然后和create.c回退方法一样
+4. write test.txt支持多行，回车换行，行号递增，光标上下左右键支持上下左右，ctrl+s才保存
+5. write test.txt
+ ! TEST.TXT ALREADY EXISTS
+ ! DO YOU WANT TO COVER THE FILE?
+ - Y/N - 在这里输入Y覆盖/N取消这次操作
+Y进入4.所描述的模式，N显示
+ - Cancelled. 
+IDE0/ >
+6. 跨簇处理啊

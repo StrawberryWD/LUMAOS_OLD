@@ -1,0 +1,438 @@
+/* kernel/gui/window2.c - LumaOS 4.1 Info + Settings Windows
+ *
+ * STAGE3 changes:
+ *   - Settings window is now a real interactive GUI panel instead of a
+ *     scrolling text block:
+ *       a. Theme: Light / Dark segmented toggle — calls gui_apply_theme()
+ *          immediately and forces a full redraw.
+ *       b. Show Desktop Icons: On/Off switch (g_show_desktop_icons).
+ *       c. Window Opacity simulation: On/Off switch (g_opacity_sim) —
+ *          when on, inactive window bodies are drawn with a stippled
+ *          dim pattern to simulate translucency.
+ *       d. Read-only info block: resolution + live window count.
+ *     Rows are still vertically scrollable if content overflows the
+ *     window (gui_window2_settings_scroll / PGUP/PGDN/wheel).
+ *   - gui_window2_settings_click(x,y) is the hit-test entry point called
+ *     by window1.c's mouse handler; returns 1 if it consumed the click.
+ *   - Info window unchanged in spirit (About text), gained wheel scroll
+ *     via gui_window2_scroll().
+ */
+
+#include "../core/kernel.h"
+#include "gui.h"
+#include "../drivers/keyboard.h"
+
+extern gui_window_t windows[MAX_WINDOWS];
+extern terminal_t   g_terminal;
+
+/* ===== About / Info text ===== */
+#define ABOUT_LINES 30
+static const char *about_text[ABOUT_LINES] = {
+    " LumaOS 4.1",
+    " ===========",
+    "",
+    " Arch   : i386 32-bit Protected Mode",
+    " Screen : BGA 800x450 256-color",
+    " Kernel : 0x00010000",
+    " Stack  : 0x00200000 (BSS, 4 KB)",
+    " BkBuf  : 0x00300000 (360 KB)",
+    " LFB    : 0xE0000000 (BGA)",
+    " Build  : GCC -m32 -O2 -ffreestanding",
+    "",
+    " Subsystems:",
+    "  * GUI (MenuBar + Dock + Windows)",
+    "  * Z-Order window management",
+    "  * Resizable + maximizable windows",
+    "  * Terminal (bash-style shell)",
+    "  * Shell (8 built-in commands)",
+    "  * Keyboard driver (E0 extended)",
+    "  * Mouse driver (IRQ12, wheel)",
+    "  * Double-buffer BGA flip",
+    "  * ACPI + CF9 power control",
+    "  * Command history (64 entries)",
+    "  * 8x8 bitmap font",
+    "",
+    " Commands:",
+    "  help    clear   version",
+    "  type    echo    color",
+    "  shutdown        reboot",
+    "",
+    " (c) LumaOS 2025",
+};
+
+static int about_scroll = 0;
+
+/* ===== Helpers ===== */
+static int w2_clamp(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static int itoa10(int v, char *out)
+{
+    char tmp[12];
+    int ti = 0;
+    if (v == 0) { out[0]='0'; out[1]=0; return 1; }
+    int neg = v < 0; if (neg) v = -v;
+    while (v > 0 && ti < 11) { tmp[ti++] = (char)('0' + (v % 10)); v /= 10; }
+    int oi = 0;
+    if (neg) out[oi++] = '-';
+    while (ti > 0) out[oi++] = tmp[--ti];
+    out[oi] = 0;
+    return oi;
+}
+
+/* ===== Tick ===== */
+void gui2_tick(void) { }
+
+/* ===== Info window init ===== */
+void gui_window2_init(void)
+{
+    int iw = 260, ih = 200;
+    int ix = DOCK_W + (SCREEN_W - DOCK_W - iw) / 2;
+    int iy = MENUBAR_H + (SCREEN_H - MENUBAR_H - ih) / 2;
+    gui_window_init(WIN_INFO, ix, iy, iw, ih, "Info", 0);
+    windows[WIN_INFO].flags &= (unsigned char)~WIN_VISIBLE;
+    about_scroll = 0;
+}
+
+/* ===== Settings window init ===== */
+void gui_window2_settings_init(void)
+{
+    int sw = 300, sh = 260;
+    int sx = DOCK_W + 40;
+    int sy = MENUBAR_H + 20;
+    gui_window_init(WIN_SETTINGS, sx, sy, sw, sh, "Settings", 0);
+    windows[WIN_SETTINGS].flags &= (unsigned char)~WIN_VISIBLE;
+}
+
+/* ===== Draw Info window content ===== */
+static void draw_info_content(void)
+{
+    if (!(windows[WIN_INFO].flags & WIN_VISIBLE)) return;
+    if (  windows[WIN_INFO].flags & WIN_MINIMIZED) return;
+
+    gui_window_t *w = &windows[WIN_INFO];
+    int cx = w->x + 2;
+    int cy = w->y + TITLEBAR_H + 1;
+    int cw = w->w - 4;
+    int ch = w->h - TITLEBAR_H - 3;
+    if (cw <= 0 || ch <= 0) return;
+
+    vga_draw_rect(cx, cy, cw, ch, COL_WIN_BODY);
+
+    int visible = ch / 9;
+    int max_sc  = ABOUT_LINES - visible;
+    if (max_sc < 0) max_sc = 0;
+    about_scroll = w2_clamp(about_scroll, 0, max_sc);
+
+    for (int row = 0; row < visible; row++) {
+        int li = about_scroll + row;
+        if (li >= ABOUT_LINES) break;
+        int max_chars = (cw - 4) / 8;
+        unsigned char col = (li < 2) ? (unsigned char)COL_WIN_TITLE
+                                     : (unsigned char)COL_TEXT_PRIMARY;
+        const char *s = about_text[li];
+        int sx2 = cx + 2;
+        for (int ci = 0; s[ci] && ci < max_chars; ci++)
+            vga_draw_char(sx2 + ci*8, cy + row*9, s[ci], col);
+    }
+
+    if (ABOUT_LINES > visible) {
+        int sbx = w->x + w->w - 5;
+        vga_draw_rect(sbx, cy, 3, ch, COL_SCROLLBAR);
+        int th = (visible * ch) / ABOUT_LINES;
+        if (th < 4) th = 4;
+        int ty2 = cy + (about_scroll * (ch - th)) / (max_sc > 0 ? max_sc : 1);
+        vga_draw_rect(sbx, ty2, 3, th, COL_SCROLLTHM);
+    }
+}
+
+/* =====================================================================
+ * Settings panel — interactive rows
+ * ===================================================================== */
+
+/* Row layout constants (content-relative y offsets, in px, top to bottom) */
+#define ROW_H        26
+#define ROW_PAD_X     6
+
+/* Row indices, used both for drawing and hit-testing so they can never
+ * drift apart. */
+enum {
+    ROW_THEME = 0,
+    ROW_DESKICONS,
+    ROW_OPACITY,
+    ROW_INFO_RES,
+    ROW_INFO_WINCOUNT,
+    ROW_COUNT
+};
+
+static int settings_scroll = 0; /* in rows, for overflow scrolling */
+
+/* Returns 1 if row `row` is a togglable control (vs read-only info) */
+static int row_is_toggle(int row)
+{
+    return row == ROW_THEME || row == ROW_DESKICONS || row == ROW_OPACITY;
+}
+
+static int live_window_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_WINDOWS - 1; i++) /* exclude spare slot 3 */
+        if (windows[i].flags & WIN_VISIBLE) n++;
+    return n;
+}
+
+/* Draw one row's control (toggle/segmented switch) at absolute (x,y).
+ * Returns the pixel width consumed, purely informational. */
+static void draw_toggle(int x, int y, int on)
+{
+    unsigned char bg = on ? (unsigned char)COL_BTN_TOGGLE_ON
+                          : (unsigned char)COL_BTN_TOGGLE_OFF;
+    vga_draw_rect(x, y, 34, 14, bg);
+    vga_draw_hline(x, y,      34, COL_WIN_BORDER);
+    vga_draw_hline(x, y+13,   34, COL_WIN_BORDER);
+    vga_draw_vline(x, y,      14, COL_WIN_BORDER);
+    vga_draw_vline(x+33, y,   14, COL_WIN_BORDER);
+    /* knob */
+    int kx = on ? x + 34 - 12 - 1 : x + 1;
+    vga_draw_rect(kx, y+1, 12, 12, COL_WHITE);
+    vga_draw_string(x + (on ? 4 : 16), y + 3, on ? "ON" : "OFF", COL_WHITE);
+}
+
+static void draw_segmented(int x, int y, int is_light)
+{
+    /* Two segments: Light | Dark */
+    int seg_w = 40, seg_h = 16;
+    vga_draw_rect(x, y, seg_w, seg_h,
+                  is_light ? (unsigned char)COL_BTN_TOGGLE_ON : (unsigned char)COL_WIN_INACT);
+    vga_draw_string(x + 4, y + 4, "Light", is_light ? COL_WHITE : COL_TEXT_SECONDARY);
+
+    vga_draw_rect(x + seg_w, y, seg_w, seg_h,
+                  !is_light ? (unsigned char)COL_BTN_TOGGLE_ON : (unsigned char)COL_WIN_INACT);
+    vga_draw_string(x + seg_w + 6, y + 4, "Dark", !is_light ? COL_WHITE : COL_TEXT_SECONDARY);
+
+    vga_draw_hline(x, y,           seg_w*2, COL_WIN_BORDER);
+    vga_draw_hline(x, y+seg_h-1,   seg_w*2, COL_WIN_BORDER);
+    vga_draw_vline(x, y,           seg_h,   COL_WIN_BORDER);
+    vga_draw_vline(x+seg_w,   y,   seg_h,   COL_WIN_BORDER);
+    vga_draw_vline(x+seg_w*2-1, y, seg_h,   COL_WIN_BORDER);
+}
+
+void gui_window2_settings_draw(void)
+{
+    if (!(windows[WIN_SETTINGS].flags & WIN_VISIBLE)) return;
+    if (  windows[WIN_SETTINGS].flags & WIN_MINIMIZED) return;
+
+    gui_window_t *w = &windows[WIN_SETTINGS];
+    int cx = w->x + 2;
+    int cy = w->y + TITLEBAR_H + 1;
+    int cw = w->w - 4;
+    int ch = w->h - TITLEBAR_H - 3;
+    if (cw <= 0 || ch <= 0) return;
+
+    vga_draw_rect(cx, cy, cw, ch, COL_SETTINGS_BG);
+
+    int visible_rows = ch / ROW_H;
+    if (visible_rows < 1) visible_rows = 1;
+    int max_sc = ROW_COUNT - visible_rows;
+    if (max_sc < 0) max_sc = 0;
+    settings_scroll = w2_clamp(settings_scroll, 0, max_sc);
+
+    char numbuf[12];
+
+    for (int slot = 0; slot < visible_rows; slot++) {
+        int row = settings_scroll + slot;
+        if (row >= ROW_COUNT) break;
+        int ry = cy + slot * ROW_H;
+
+        /* Row separator */
+        if (slot > 0) vga_draw_hline(cx, ry, cw, COL_PANEL_BORDER);
+
+        int label_y = ry + ROW_H/2 - 4;
+
+        switch (row) {
+        case ROW_THEME:
+            vga_draw_string(cx + ROW_PAD_X, label_y, "Theme:", COL_TEXT_PRIMARY);
+            draw_segmented(cx + cw - 6 - 80, ry + (ROW_H-16)/2, g_theme_light);
+            break;
+
+        case ROW_DESKICONS:
+            vga_draw_string(cx + ROW_PAD_X, label_y, "Show Desktop Icons:", COL_TEXT_PRIMARY);
+            draw_toggle(cx + cw - 6 - 34, ry + (ROW_H-14)/2, g_show_desktop_icons);
+            break;
+
+        case ROW_OPACITY:
+            vga_draw_string(cx + ROW_PAD_X, label_y, "Window Opacity Sim:", COL_TEXT_PRIMARY);
+            draw_toggle(cx + cw - 6 - 34, ry + (ROW_H-14)/2, g_opacity_sim);
+            break;
+
+        case ROW_INFO_RES: {
+            vga_draw_string(cx + ROW_PAD_X, label_y, "Resolution:", COL_TEXT_SECONDARY);
+            itoa10(SCREEN_W, numbuf);
+            int xx = cx + cw - 6 - 60;
+            vga_draw_string(xx, label_y, numbuf, COL_TEXT_PRIMARY);
+            xx += (int)strlen(numbuf) * 8;
+            vga_draw_string(xx, label_y, "x", COL_TEXT_PRIMARY);
+            xx += 8;
+            itoa10(SCREEN_H, numbuf);
+            vga_draw_string(xx, label_y, numbuf, COL_TEXT_PRIMARY);
+            break;
+        }
+
+        case ROW_INFO_WINCOUNT: {
+            vga_draw_string(cx + ROW_PAD_X, label_y, "Open Windows:", COL_TEXT_SECONDARY);
+            itoa10(live_window_count(), numbuf);
+            vga_draw_string(cx + cw - 6 - 20, label_y, numbuf, COL_TEXT_PRIMARY);
+            break;
+        }
+        }
+    }
+
+    /* Scrollbar if content overflows */
+    if (ROW_COUNT > visible_rows) {
+        int sbx = w->x + w->w - 5;
+        vga_draw_rect(sbx, cy, 3, ch, COL_SCROLLBAR);
+        int th = (visible_rows * ch) / ROW_COUNT;
+        if (th < 4) th = 4;
+        int ty2 = cy + (settings_scroll * (ch - th)) / (max_sc > 0 ? max_sc : 1);
+        vga_draw_rect(sbx, ty2, 3, th, COL_SCROLLTHM);
+    }
+}
+
+/* ===== Settings click hit-test =====
+ * Called by window1.c's mouse handler with absolute screen coords.
+ * Returns 1 if the click was consumed by a control, 0 otherwise (so
+ * the caller can still treat it as a plain focus/drag click). */
+int gui_window2_settings_click(int x, int y)
+{
+    if (!(windows[WIN_SETTINGS].flags & WIN_VISIBLE)) return 0;
+    if (  windows[WIN_SETTINGS].flags & WIN_MINIMIZED) return 0;
+
+    gui_window_t *w = &windows[WIN_SETTINGS];
+    int cx = w->x + 2;
+    int cy = w->y + TITLEBAR_H + 1;
+    int cw = w->w - 4;
+    int ch = w->h - TITLEBAR_H - 3;
+    if (cw <= 0 || ch <= 0) return 0;
+    if (x < cx || x >= cx+cw || y < cy || y >= cy+ch) return 0;
+
+    int visible_rows = ch / ROW_H;
+    if (visible_rows < 1) visible_rows = 1;
+    int slot = (y - cy) / ROW_H;
+    int row = settings_scroll + slot;
+    if (row < 0 || row >= ROW_COUNT) return 0;
+    if (!row_is_toggle(row)) return 0; /* read-only rows aren't clickable */
+
+    int ry = cy + slot * ROW_H;
+
+    if (row == ROW_THEME) {
+        int seg_x = cx + cw - 6 - 80;
+        int seg_y = ry + (ROW_H-16)/2;
+        if (x >= seg_x && x < seg_x+40 && y >= seg_y && y < seg_y+16) {
+            gui_apply_theme(1); return 1;   /* Light */
+        }
+        if (x >= seg_x+40 && x < seg_x+80 && y >= seg_y && y < seg_y+16) {
+            gui_apply_theme(0); return 1;   /* Dark */
+        }
+        return 1; /* clicked in row but missed both segments — still consume */
+    }
+
+    if (row == ROW_DESKICONS) {
+        int tx = cx + cw - 6 - 34;
+        int ty = ry + (ROW_H-14)/2;
+        if (x >= tx && x < tx+34 && y >= ty && y < ty+14) {
+            g_show_desktop_icons = !g_show_desktop_icons;
+            g_terminal.redraw_needed = 1;
+        }
+        return 1;
+    }
+
+    if (row == ROW_OPACITY) {
+        int tx = cx + cw - 6 - 34;
+        int ty = ry + (ROW_H-14)/2;
+        if (x >= tx && x < tx+34 && y >= ty && y < ty+14) {
+            g_opacity_sim = !g_opacity_sim;
+            g_terminal.redraw_needed = 1;
+        }
+        return 1;
+    }
+
+    return 0;
+}
+
+/* ===== Public Info-window draw entry point =====
+ * Called from gui_window_draw() (window1.c) inside the z-order-
+ * respecting per-window draw pass, exactly like
+ * gui_window2_settings_draw() already is for Settings. Previously the
+ * Info content was painted by gui2_draw_overlay() as a *global* pass
+ * that ran after every window had already been drawn in z-order, so it
+ * always ended up on top of everything else on screen -- even windows
+ * stacked above the (possibly not even focused) Info window. Routing
+ * it through the same per-window path as Settings/Terminal fixes that:
+ * it now only ever draws where Info's own z-order slot puts it. */
+void gui_window2_info_draw(void)
+{
+    draw_info_content();
+}
+
+/* ===== Public draw overlay =====
+ * No longer draws Info content (see gui_window2_info_draw() above) --
+ * kept as a hook for any future overlay that must genuinely sit above
+ * every window (e.g. a global toast/notification), which the Info
+ * window's z-order-scoped content must not.  Currently a no-op. */
+void gui2_draw_overlay(void)
+{
+    /* Settings content is drawn by gui_window_draw() via callback */
+}
+
+/* ===== Key routing — Info window ===== */
+void gui_window2_key(unsigned char key)
+{
+    if (key == KEY_UP || key == KEY_PGUP) {
+        if (about_scroll > 0) { about_scroll--; g_terminal.redraw_needed=1; }
+    } else if (key == KEY_DOWN || key == KEY_PGDN) {
+        int visible = (windows[WIN_INFO].h - TITLEBAR_H - 3) / 9;
+        int max_sc  = ABOUT_LINES - visible;
+        if (max_sc < 0) max_sc = 0;
+        if (about_scroll < max_sc) { about_scroll++; g_terminal.redraw_needed=1; }
+    }
+}
+
+/* ===== Wheel scroll — Info window ===== */
+void gui_window2_scroll(int delta)
+{
+    int visible = (windows[WIN_INFO].h - TITLEBAR_H - 3) / 9;
+    int max_sc  = ABOUT_LINES - visible;
+    if (max_sc < 0) max_sc = 0;
+    about_scroll = w2_clamp(about_scroll + delta, 0, max_sc);
+    g_terminal.redraw_needed = 1;
+}
+
+/* ===== Key routing — Settings window ===== */
+void gui_window2_settings_key(unsigned char key)
+{
+    int visible_rows = (windows[WIN_SETTINGS].h - TITLEBAR_H - 3) / ROW_H;
+    if (visible_rows < 1) visible_rows = 1;
+    int max_sc = ROW_COUNT - visible_rows;
+    if (max_sc < 0) max_sc = 0;
+
+    if (key == KEY_UP || key == KEY_PGUP) {
+        if (settings_scroll > 0) { settings_scroll--; g_terminal.redraw_needed=1; }
+    } else if (key == KEY_DOWN || key == KEY_PGDN) {
+        if (settings_scroll < max_sc) { settings_scroll++; g_terminal.redraw_needed=1; }
+    }
+}
+
+/* ===== Wheel scroll — Settings window ===== */
+void gui_window2_settings_scroll(int delta)
+{
+    int visible_rows = (windows[WIN_SETTINGS].h - TITLEBAR_H - 3) / ROW_H;
+    if (visible_rows < 1) visible_rows = 1;
+    int max_sc = ROW_COUNT - visible_rows;
+    if (max_sc < 0) max_sc = 0;
+    settings_scroll = w2_clamp(settings_scroll + delta, 0, max_sc);
+    g_terminal.redraw_needed = 1;
+}
